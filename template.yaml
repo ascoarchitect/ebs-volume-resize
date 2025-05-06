@@ -1,0 +1,715 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'CloudFormation template for EBS volume auto-resize using Step Functions'
+
+Resources:
+  # IAM Role for the Step Functions
+  EBSResizeStepFunctionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: EBSResizeStepFunctionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:ModifyVolume'
+                  - 'ec2:DescribeTags'
+                  - 'ec2:CreateTags'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'lambda:InvokeFunction'
+                Resource: '*'
+              - Effect: Allow
+                Action: 'ssm:SendCommand'
+                Resource: '*'
+
+  # Lambda Role for volume checks and resize operations
+  EBSResizeLambdaRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: EBSResizeLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:ModifyVolume'
+                  - 'ec2:DescribeTags'
+                  - 'ec2:CreateTags'
+                  - 'ec2:DescribeInstances'
+                Resource: '*'
+
+  # Lambda function to validate volume tags and calculate new size
+  EvaluateVolumeTagsFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSResizeLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def handler(event, context):
+              volume_id = event['volumeId']
+              
+              ec2 = boto3.client('ec2')
+              
+              # Get volume information
+              response = ec2.describe_volumes(VolumeIds=[volume_id])
+              
+              if not response['Volumes']:
+                  return {
+                      'resizeNeeded': False,
+                      'reason': f"Volume {volume_id} not found"
+                  }
+              
+              volume = response['Volumes'][0]
+              current_size = volume['Size']
+              
+              # Get volume tags
+              tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+              
+              # Check if auto-resize is enabled
+              if tags.get('EBSAutoResize', 'false').lower() != 'true':
+                  return {
+                      'resizeNeeded': False,
+                      'reason': f"Auto-resize not enabled for volume {volume_id}"
+                  }
+              
+              # Get resize amount and max size from tags
+              try:
+                  resize_amount = int(tags.get('ResizeAmountGB', '10'))
+                  max_size = int(tags.get('MaxResizeGB', '1000'))
+              except ValueError as e:
+                  return {
+                      'resizeNeeded': False,
+                      'reason': f"Invalid tag values: {str(e)}"
+                  }
+              
+              # Calculate new size
+              new_size = current_size + resize_amount
+              
+              # Ensure we don't exceed max size
+              if new_size > max_size:
+                  if current_size >= max_size:
+                      return {
+                          'resizeNeeded': False,
+                          'reason': f"Volume already at or exceeding maximum size of {max_size} GB"
+                      }
+                  new_size = max_size
+              
+              # Determine attachment information
+              attachment_info = None
+              if volume['Attachments']:
+                  attachment = volume['Attachments'][0]
+                  attachment_info = {
+                      'instanceId': attachment['InstanceId'],
+                      'device': attachment['Device']
+                  }
+              
+              return {
+                  'resizeNeeded': True,
+                  'volumeId': volume_id,
+                  'currentSize': current_size,
+                  'newSize': new_size,
+                  'attachment': attachment_info
+              }
+
+  # Lambda function to resize the volume
+  ResizeVolumeFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSResizeLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          from datetime import datetime
+          
+          def handler(event, context):
+              volume_id = event['volumeId']
+              new_size = event['newSize']
+              current_size = event['currentSize']
+              
+              ec2 = boto3.client('ec2')
+              
+              try:
+                  # Perform the resize
+                  response = ec2.modify_volume(
+                      VolumeId=volume_id,
+                      Size=new_size
+                  )
+                  
+                  # Add a tag to track resize history
+                  timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                  ec2.create_tags(
+                      Resources=[volume_id],
+                      Tags=[
+                          {
+                              'Key': 'LastAutoResize',
+                              'Value': f"{timestamp}: Resized from {current_size}GB to {new_size}GB"
+                          }
+                      ]
+                  )
+                  
+                  return {
+                      'volumeId': volume_id,
+                      'resizeStatus': 'Initiated',
+                      'currentSize': current_size,
+                      'targetSize': new_size
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'error': str(e),
+                      'volumeId': volume_id
+                  }
+
+  # Lambda function to check the OS type
+  CheckOSTypeFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSResizeLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          
+          def handler(event, context):
+              if not event.get('attachment'):
+                  return {
+                      'hasInstance': False,
+                      'reason': 'Volume not attached to any instance'
+                  }
+                  
+              instance_id = event['attachment']['instanceId']
+              device = event['attachment']['device']
+              
+              ec2 = boto3.client('ec2')
+              
+              # Get instance information
+              response = ec2.describe_instances(InstanceIds=[instance_id])
+              
+              if not response['Reservations'] or not response['Reservations'][0]['Instances']:
+                  return {
+                      'hasInstance': False,
+                      'reason': f"Instance {instance_id} not found"
+                  }
+                  
+              instance = response['Reservations'][0]['Instances'][0]
+              platform_details = instance.get('PlatformDetails', 'Linux/UNIX')
+              
+              is_windows = 'Windows' in platform_details
+              
+              return {
+                  'hasInstance': True,
+                  'instanceId': instance_id,
+                  'device': device,
+                  'isWindows': is_windows,
+                  'platformDetails': platform_details
+              }
+
+  # Lambda function to extend Linux file system
+  ExtendLinuxFilesystemFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSResizeLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          
+          def handler(event, context):
+              instance_id = event['instanceId']
+              device = event['device']
+              
+              ssm = boto3.client('ssm')
+              
+              # Prepare the shell script
+              device_name = device.replace('/dev/sd', '/dev/xvd')
+              commands = f"""
+              # Get the file system type
+              DEVICE="{device_name}"
+              MOUNT_POINT=$(df -h | grep $DEVICE | awk '{{print $6}}')
+              FSTYPE=$(lsblk -f $DEVICE -o FSTYPE | tail -n 1)
+              
+              echo "Device: $DEVICE, Mount point: $MOUNT_POINT, Filesystem type: $FSTYPE"
+              
+              # Extend the file system based on type
+              if [[ "$FSTYPE" == "xfs" ]]; then
+                xfs_growfs $MOUNT_POINT
+                echo "Extended XFS filesystem"
+              elif [[ "$FSTYPE" == "ext"* ]]; then
+                resize2fs $DEVICE
+                echo "Extended EXT filesystem"
+              else
+                echo "Unsupported file system type: $FSTYPE"
+                exit 1
+              fi
+              """
+              
+              try:
+                  # Run the command on the instance
+                  response = ssm.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName='AWS-RunShellScript',
+                      Parameters={'commands': [commands]},
+                      Comment='Extend Linux filesystem after EBS resize'
+                  )
+                  
+                  command_id = response['Command']['CommandId']
+                  
+                  return {
+                      'success': True,
+                      'instanceId': instance_id,
+                      'commandId': command_id
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'success': False,
+                      'error': str(e),
+                      'instanceId': instance_id
+                  }
+
+  # Lambda function to extend Windows file system
+  ExtendWindowsFilesystemFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSResizeLambdaRole.Arn
+      Runtime: python3.9
+      Timeout: 60
+      Code:
+        ZipFile: |
+          import boto3
+          
+          def handler(event, context):
+              instance_id = event['instanceId']
+              
+              ssm = boto3.client('ssm')
+              
+              # Prepare the PowerShell script
+              commands = """
+              $disks = Get-Disk
+              
+              # Find all disks with a RAW partition (typically indicating unallocated space)
+              foreach ($disk in $disks) {
+                  $partitions = Get-Partition -DiskNumber $disk.Number
+                  $needsExtend = $false
+                  
+                  # Check if disk has any valid volumes
+                  foreach ($partition in $partitions) {
+                      if ($partition.Type -ne "Reserved" -and $partition.DriveLetter) {
+                          $needsExtend = $true
+                          $partitionNumber = $partition.PartitionNumber
+                          $driveLetter = $partition.DriveLetter
+                          
+                          # Get max size for partition
+                          $maxSize = (Get-PartitionSupportedSize -DiskNumber $disk.Number -PartitionNumber $partitionNumber).SizeMax
+                          
+                          # Extend the partition
+                          Write-Output "Extending partition $partitionNumber on disk $($disk.Number) (Drive $driveLetter) to maximum size"
+                          Resize-Partition -DiskNumber $disk.Number -PartitionNumber $partitionNumber -Size $maxSize
+                      }
+                  }
+              }
+              
+              Write-Output "Disk extension complete"
+              """
+              
+              try:
+                  # Run the command on the instance
+                  response = ssm.send_command(
+                      InstanceIds=[instance_id],
+                      DocumentName='AWS-RunPowerShellScript',
+                      Parameters={'commands': [commands]},
+                      Comment='Extend Windows filesystem after EBS resize'
+                  )
+                  
+                  command_id = response['Command']['CommandId']
+                  
+                  return {
+                      'success': True,
+                      'instanceId': instance_id,
+                      'commandId': command_id
+                  }
+                  
+              except Exception as e:
+                  return {
+                      'success': False,
+                      'error': str(e),
+                      'instanceId': instance_id
+                  }
+
+  # Step Functions State Machine
+  EBSResizeStateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt EBSResizeStepFunctionRole.Arn
+      DefinitionString: !Sub |
+        {
+          "Comment": "State machine for auto-resizing EBS volumes",
+          "StartAt": "EvaluateVolumeTags",
+          "States": {
+            "EvaluateVolumeTags": {
+              "Type": "Task",
+              "Resource": "${EvaluateVolumeTagsFunction.Arn}",
+              "Next": "IsResizeNeeded"
+            },
+            "IsResizeNeeded": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.resizeNeeded",
+                  "BooleanEquals": true,
+                  "Next": "ResizeVolume"
+                }
+              ],
+              "Default": "ResizeNotNeeded"
+            },
+            "ResizeNotNeeded": {
+              "Type": "Succeed"
+            },
+            "ResizeVolume": {
+              "Type": "Task",
+              "Resource": "${ResizeVolumeFunction.Arn}",
+              "Next": "WaitForResize"
+            },
+            "WaitForResize": {
+              "Type": "Wait",
+              "Seconds": 30,
+              "Next": "CheckOSType"
+            },
+            "CheckOSType": {
+              "Type": "Task",
+              "Resource": "${CheckOSTypeFunction.Arn}",
+              "Next": "IsInstanceAttached"
+            },
+            "IsInstanceAttached": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.hasInstance",
+                  "BooleanEquals": true,
+                  "Next": "IsWindowsOS"
+                }
+              ],
+              "Default": "NoInstanceAttached"
+            },
+            "NoInstanceAttached": {
+              "Type": "Succeed"
+            },
+            "IsWindowsOS": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.isWindows",
+                  "BooleanEquals": true,
+                  "Next": "ExtendWindowsFilesystem"
+                }
+              ],
+              "Default": "ExtendLinuxFilesystem"
+            },
+            "ExtendLinuxFilesystem": {
+              "Type": "Task",
+              "Resource": "${ExtendLinuxFilesystemFunction.Arn}",
+              "Next": "ResizeComplete"
+            },
+            "ExtendWindowsFilesystem": {
+              "Type": "Task",
+              "Resource": "${ExtendWindowsFilesystemFunction.Arn}",
+              "Next": "ResizeComplete"
+            },
+            "ResizeComplete": {
+              "Type": "Succeed"
+            }
+          }
+        }
+
+  # IAM Role for CloudWatch Alarm Creation Lambda
+  EBSAlarmCreationRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: EBSAlarmCreationPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'ec2:DescribeVolumes'
+                  - 'ec2:DescribeTags'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'cloudwatch:PutMetricAlarm'
+                  - 'cloudwatch:DescribeAlarms'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'events:PutRule'
+                  - 'events:PutTargets'
+                  - 'events:DescribeRule'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'lambda:AddPermission'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'iam:GetRole'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'sts:GetCallerIdentity'
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - 'states:StartExecution'
+                Resource: !Ref EBSResizeStateMachine
+
+  # Lambda function to set up CloudWatch alarms
+  EBSAlarmCreationFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Handler: index.handler
+      Role: !GetAtt EBSAlarmCreationRole.Arn
+      Runtime: python3.9
+      Timeout: 300
+      Code:
+        ZipFile: !Sub |
+          import boto3
+          import json
+          import logging
+          import cfnresponse
+          
+          # Setup logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+          
+          ec2 = boto3.client('ec2')
+          cloudwatch = boto3.client('cloudwatch')
+          events = boto3.client('events')
+          
+          STATE_MACHINE_ARN = '${EBSResizeStateMachine}'
+          
+          def handler(event, context):
+              logger.info(f"Received event: {json.dumps(event)}")
+              
+              # Handle CloudFormation custom resource events
+              if event.get('RequestType') == 'Create' or event.get('RequestType') == 'Update':
+                  try:
+                      # Get all EBS volumes
+                      volumes_response = ec2.describe_volumes()
+                      
+                      for volume in volumes_response['Volumes']:
+                          volume_id = volume['VolumeId']
+                          tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+                          
+                          # Check if auto-resize is enabled via tag
+                          if tags.get('EBSAutoResize', 'false').lower() == 'true':
+                              create_volume_alarm(volume_id, volume['Size'])
+                      
+                      # Set up EventBridge rule to check for new volumes periodically
+                      setup_volume_check_schedule(context.invoked_function_arn)
+                      
+                      cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                      {'Message': 'Successfully created alarms for tagged volumes'})
+                  except Exception as e:
+                      logger.error(f"Error setting up alarms: {e}")
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                      {'Message': f"Error: {str(e)}"})
+              
+              elif event.get('RequestType') == 'Delete':
+                  # Handle stack deletion - could clean up alarms here
+                  cfnresponse.send(event, context, cfnresponse.SUCCESS, 
+                                  {'Message': 'Resource deletion acknowledged'})
+              
+              # Handle scheduled events to check for new volumes
+              elif event.get('source') == 'aws.events':
+                  check_for_new_volumes()
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps('Completed check for new volumes')
+                  }
+              
+              else:
+                  logger.warning(f"Unhandled event type: {event}")
+                  if 'ResponseURL' in event:  # This is a CloudFormation event
+                      cfnresponse.send(event, context, cfnresponse.FAILED, 
+                                      {'Message': 'Unhandled request type'})
+          
+          def create_volume_alarm(volume_id, volume_size):
+              # Calculate the threshold (90% of volume size)
+              threshold = int(volume_size * 0.9)
+              
+              alarm_name = f"EBSVolumeUsageAlarm-{volume_id}"
+              
+              # Create or update CloudWatch alarm for the volume
+              cloudwatch.put_metric_alarm(
+                  AlarmName=alarm_name,
+                  ComparisonOperator='GreaterThanOrEqualToThreshold',
+                  EvaluationPeriods=3,
+                  MetricName='VolumeUsedSize',
+                  Namespace='AWS/EBS',
+                  Period=300,  # 5 minutes
+                  Statistic='Average',
+                  Threshold=threshold,
+                  ActionsEnabled=True,
+                  AlarmDescription=f'Alarm when EBS volume {volume_id} usage exceeds 90%',
+                  Dimensions=[
+                      {
+                          'Name': 'VolumeId',
+                          'Value': volume_id
+                      },
+                  ]
+              )
+              
+              # Set up event target for Step Functions
+              rule_name = f"TriggerEBSResize-{volume_id}"
+              events.put_rule(
+                  Name=rule_name,
+                  EventPattern=json.dumps({
+                      "source": ["aws.cloudwatch"],
+                      "detail-type": ["CloudWatch Alarm State Change"],
+                      "detail": {
+                          "alarmName": [alarm_name],
+                          "state": {
+                              "value": ["ALARM"]
+                          }
+                      }
+                  }),
+                  State='ENABLED'
+              )
+              
+              # Target the Step Function with the volume ID as input
+              events.put_targets(
+                  Rule=rule_name,
+                  Targets=[
+                      {
+                          'Id': f'StepFunction-{volume_id}',
+                          'Arn': STATE_MACHINE_ARN,
+                          'RoleArn': boto3.client("iam").get_role(RoleName='EBSResizeStepFunctionRole')['Role']['Arn'],
+                          'Input': json.dumps({
+                              "volumeId": volume_id
+                          })
+                      }
+                  ]
+              )
+              
+              logger.info(f"Created/updated alarm and event rule for volume {volume_id}")
+          
+          def check_for_new_volumes():
+              # Get all EBS volumes
+              volumes_response = ec2.describe_volumes()
+              
+              # Get all existing volume alarms
+              existing_alarms = set()
+              paginator = cloudwatch.get_paginator('describe_alarms')
+              for page in paginator.paginate(AlarmNamePrefix='EBSVolumeUsageAlarm-'):
+                  for alarm in page['MetricAlarms']:
+                      alarm_name = alarm['AlarmName']
+                      if alarm_name.startswith('EBSVolumeUsageAlarm-'):
+                          volume_id = alarm_name.split('-')[1]
+                          existing_alarms.add(volume_id)
+              
+              # Check each volume
+              for volume in volumes_response['Volumes']:
+                  volume_id = volume['VolumeId']
+                  
+                  # Get volume tags
+                  tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+                  
+                  # If auto-resize is enabled and no alarm exists yet
+                  if tags.get('EBSAutoResize', 'false').lower() == 'true' and volume_id not in existing_alarms:
+                      create_volume_alarm(volume_id, volume['Size'])
+          
+          def setup_volume_check_schedule(lambda_arn):
+              # Create an EventBridge rule to run every hour
+              events.put_rule(
+                  Name='CheckForNewEBSVolumesRule',
+                  ScheduleExpression='rate(1 hour)',
+                  State='ENABLED',
+                  Description='Check for new EBS volumes to set up monitoring'
+              )
+              
+              # Set the Lambda function as the target
+              events.put_targets(
+                  Rule='CheckForNewEBSVolumesRule',
+                  Targets=[
+                      {
+                          'Id': 'EBSVolumeCheckTarget',
+                          'Arn': lambda_arn
+                      }
+                  ]
+              )
+              
+              # Add permission for EventBridge to invoke Lambda
+              lambda_client = boto3.client('lambda')
+              try:
+                  lambda_client.add_permission(
+                      FunctionName=lambda_arn.split(':')[6],
+                      StatementId='AllowEventBridgeToInvokeLambda',
+                      Action='lambda:InvokeFunction',
+                      Principal='events.amazonaws.com',
+                      SourceArn=events.describe_rule(Name='CheckForNewEBSVolumesRule')['Arn']
+                  )
+              except lambda_client.exceptions.ResourceConflictException:
+                  # Permission already exists
+                  pass
+
+  # Custom Resource to trigger creation of CloudWatch Alarms
+  EBSAlarmSetup:
+    Type: 'AWS::CloudFormation::CustomResource'
+    Properties:
+      ServiceToken: !GetAtt EBSAlarmCreationFunction.Arn
+
+Outputs:
+  EBSResizeStateMachine:
+    Description: 'Step Functions State Machine that handles EBS volume resizing'
+    Value: !Ref EBSResizeStateMachine
+  EBSAlarmCreationFunction:
+    Description: 'Lambda function that creates CloudWatch alarms for EBS volumes'
+    Value: !GetAtt EBSAlarmCreationFunction.Arn
