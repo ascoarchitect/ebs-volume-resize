@@ -66,7 +66,9 @@ Resources:
     Properties:
       Handler: index.handler
       Role: !GetAtt EBSResizeLambdaRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 30
       Code:
         ZipFile: |
@@ -93,14 +95,7 @@ Resources:
               # Get volume tags
               tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
               
-              # Check if auto-resize is enabled
-              if tags.get('EBSAutoResize', 'false').lower() != 'true':
-                  return {
-                      'resizeNeeded': False,
-                      'reason': f"Auto-resize not enabled for volume {volume_id}"
-                  }
-              
-              # Get resize amount and max size from tags
+              # Get resize amount and max size from volume tags
               try:
                   resize_amount = int(tags.get('ResizeAmountGB', '10'))
                   max_size = int(tags.get('MaxResizeGB', '1000'))
@@ -145,7 +140,9 @@ Resources:
     Properties:
       Handler: index.handler
       Role: !GetAtt EBSResizeLambdaRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 60
       Code:
         ZipFile: |
@@ -198,7 +195,9 @@ Resources:
     Properties:
       Handler: index.handler
       Role: !GetAtt EBSResizeLambdaRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 30
       Code:
         ZipFile: |
@@ -244,7 +243,9 @@ Resources:
     Properties:
       Handler: index.handler
       Role: !GetAtt EBSResizeLambdaRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 60
       Code:
         ZipFile: |
@@ -310,7 +311,9 @@ Resources:
     Properties:
       Handler: index.handler
       Role: !GetAtt EBSResizeLambdaRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 60
       Code:
         ZipFile: |
@@ -481,6 +484,7 @@ Resources:
                 Action:
                   - 'ec2:DescribeVolumes'
                   - 'ec2:DescribeTags'
+                  - 'ec2:DescribeInstances'
                 Resource: '*'
               - Effect: Allow
                 Action:
@@ -502,6 +506,9 @@ Resources:
                   - 'iam:GetRole'
                 Resource: '*'
               - Effect: Allow
+                Action: 'iam:PassRole'
+                Resource: !GetAtt EBSResizeStepFunctionRole.Arn
+              - Effect: Allow
                 Action:
                   - 'sts:GetCallerIdentity'
                 Resource: '*'
@@ -509,54 +516,84 @@ Resources:
                 Action:
                   - 'states:StartExecution'
                 Resource: !Ref EBSResizeStateMachine
+              # Add SSM permissions for retrieving mount points
+              - Effect: Allow
+                Action:
+                  - 'ssm:SendCommand'
+                  - 'ssm:GetCommandInvocation'
+                Resource: '*'
 
   # Lambda function to set up CloudWatch alarms
   EBSAlarmCreationFunction:
     Type: 'AWS::Lambda::Function'
     Properties:
       Handler: index.handler
+      Environment:
+        Variables:
+          STEP_FUNCTION_ROLE_ARN: !GetAtt EBSResizeStepFunctionRole.Arn
+          STATE_MACHINE_ARN: !Ref EBSResizeStateMachine
       Role: !GetAtt EBSAlarmCreationRole.Arn
-      Runtime: python3.9
+      Runtime: python3.13
+      Architectures:
+        - arm64
       Timeout: 300
       Code:
         ZipFile: !Sub |
+          import os
           import boto3
           import json
           import logging
           import cfnresponse
-          
+          import time
+          import re
+          import unicodedata
+
           # Setup logging
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
-          
+
           ec2 = boto3.client('ec2')
           cloudwatch = boto3.client('cloudwatch')
           events = boto3.client('events')
-          
-          STATE_MACHINE_ARN = '${EBSResizeStateMachine}'
-          
+          ssm = boto3.client('ssm')
+
+          STATE_MACHINE_ARN = os.environ['STATE_MACHINE_ARN']
+
           def handler(event, context):
               logger.info(f"Received event: {json.dumps(event)}")
               
               # Handle CloudFormation custom resource events
               if event.get('RequestType') == 'Create' or event.get('RequestType') == 'Update':
                   try:
-                      # Get all EBS volumes
-                      volumes_response = ec2.describe_volumes()
+                      # Get all EC2 instances
+                      ec2_response = ec2.describe_instances()
                       
-                      for volume in volumes_response['Volumes']:
-                          volume_id = volume['VolumeId']
-                          tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
-                          
-                          # Check if auto-resize is enabled via tag
-                          if tags.get('EBSAutoResize', 'false').lower() == 'true':
-                              create_volume_alarm(volume_id, volume['Size'])
+                      # Process all instances to find ones with EBSAutoResize tag
+                      for reservation in ec2_response['Reservations']:
+                          for instance in reservation['Instances']:
+                              instance_id = instance['InstanceId']
+                              
+                              # Get instance tags
+                              instance_tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                              
+                              # Check if auto-resize is enabled for this instance
+                              if instance_tags.get('EBSAutoResize', 'false').lower() == 'true':
+                                  logger.info(f"Instance {instance_id} has EBSAutoResize tag enabled. Setting up monitoring.")
+                                  
+                                  # For each attached volume, set up monitoring
+                                  for block_device in instance.get('BlockDeviceMappings', []):
+                                      if 'Ebs' in block_device:
+                                          volume_id = block_device['Ebs']['VolumeId']
+                                          device = block_device['DeviceName']
+                                          
+                                          # Set up monitoring for this volume
+                                          setup_volume_monitoring(instance_id, volume_id, device)
                       
                       # Set up EventBridge rule to check for new volumes periodically
-                      setup_volume_check_schedule(context.invoked_function_arn)
+                      setup_instance_check_schedule(context.invoked_function_arn)
                       
                       cfnresponse.send(event, context, cfnresponse.SUCCESS, 
-                                      {'Message': 'Successfully created alarms for tagged volumes'})
+                                      {'Message': 'Successfully created alarms for tagged instances'})
                   except Exception as e:
                       logger.error(f"Error setting up alarms: {e}")
                       cfnresponse.send(event, context, cfnresponse.FAILED, 
@@ -567,12 +604,12 @@ Resources:
                   cfnresponse.send(event, context, cfnresponse.SUCCESS, 
                                   {'Message': 'Resource deletion acknowledged'})
               
-              # Handle scheduled events to check for new volumes
+              # Handle scheduled events to check for new instances/volumes
               elif event.get('source') == 'aws.events':
-                  check_for_new_volumes()
+                  check_for_tagged_instances()
                   return {
                       'statusCode': 200,
-                      'body': json.dumps('Completed check for new volumes')
+                      'body': json.dumps('Completed check for new instances')
                   }
               
               else:
@@ -580,107 +617,234 @@ Resources:
                   if 'ResponseURL' in event:  # This is a CloudFormation event
                       cfnresponse.send(event, context, cfnresponse.FAILED, 
                                       {'Message': 'Unhandled request type'})
-          
-          def create_volume_alarm(volume_id, volume_size):
-              # Calculate the threshold (90% of volume size)
-              threshold = int(volume_size * 0.9)
+
+          def sanitize_string(s):
+              """
+              Remove non-ASCII characters from string to prevent CloudWatch API errors
+              """
+              if not s:
+                  return ""
               
-              alarm_name = f"EBSVolumeUsageAlarm-{volume_id}"
+              # First normalize Unicode (e.g., convert é to e)
+              normalized = unicodedata.normalize('NFKD', s)
               
-              # Create or update CloudWatch alarm for the volume
-              cloudwatch.put_metric_alarm(
-                  AlarmName=alarm_name,
-                  ComparisonOperator='GreaterThanOrEqualToThreshold',
-                  EvaluationPeriods=3,
-                  MetricName='VolumeUsedSize',
-                  Namespace='AWS/EBS',
-                  Period=300,  # 5 minutes
-                  Statistic='Average',
-                  Threshold=threshold,
-                  ActionsEnabled=True,
-                  AlarmDescription=f'Alarm when EBS volume {volume_id} usage exceeds 90%',
-                  Dimensions=[
-                      {
-                          'Name': 'VolumeId',
-                          'Value': volume_id
-                      },
-                  ]
-              )
+              # Strip accents
+              result = ''.join([c for c in normalized if not unicodedata.combining(c)])
+              
+              # Remove remaining non-ASCII characters
+              result = re.sub(r'[^\x00-\x7F]+', '', result).strip()
+              
+              # If the result is empty after sanitization, return a safe default
+              if not result:
+                  return "root"
+                  
+              # Ensure the string doesn't contain any problematic characters for CloudWatch
+              result = re.sub(r'[^a-zA-Z0-9_\-./]', '_', result)
+              
+              return result
+
+          def get_mount_path(instance_id, device):
+              """
+              Get the mount path for a device on an instance using SSM
+              """
+              # Set default mount path in case we can't determine it
+              mount_path = "/"
+              
+              try:
+                  # Convert device path to how it appears in the instance
+                  device_name = device.replace('/dev/sd', '/dev/xvd')
+                  
+                  # Get the mount point using df command - safely catch all errors
+                  try:
+                      # Run the SSM command to get the mount point
+                      response = ssm.send_command(
+                          InstanceIds=[instance_id],
+                          DocumentName='AWS-RunShellScript',
+                          Parameters={'commands': [f"df -h | grep {device_name} | awk '{{print $6}}'"]}
+                      )
+                      
+                      time.sleep(3)  # Brief wait for command to complete
+                      
+                      # Get the result
+                      result = ssm.get_command_invocation(
+                          CommandId=response['Command']['CommandId'],
+                          InstanceId=instance_id
+                      )
+                      
+                      # Extract the mount point from the command output
+                      if result['Status'] == 'Success' and result['StandardOutputContent'].strip():
+                          mount_path = sanitize_string(result['StandardOutputContent'].strip())
+                          logger.info(f"Found mount path {mount_path} for device {device_name} on instance {instance_id}")
+                      else:
+                          logger.warning(f"Could not determine mount path for {device_name}. Using default '/'")
+                  except Exception as e:
+                      logger.error(f"Error in SSM command: {str(e)}")
+                      logger.warning(f"Using default path '/' for alarm for device {device}")
+              except Exception as e:
+                  logger.error(f"Error determining mount path: {str(e)}")
+                  logger.warning(f"Using default path '/' for CloudWatch alarm")
+              
+              return mount_path
+
+          def setup_volume_monitoring(instance_id, volume_id, device):
+              """
+              Set up monitoring for a specific volume attached to an instance
+              """
+              # Get the mount path for this device
+              mount_path = get_mount_path(instance_id, device)
+              
+              # Create a unique alarm name for this instance and mount path
+              alarm_name = f"EBSAutoResize-{instance_id}-{sanitize_string(mount_path)}"
+              
+              # Set alarm threshold to 90%
+              threshold = 90
+              
+              # Get the volume information for resize parameters
+              try:
+                  volume_response = ec2.describe_volumes(VolumeIds=[volume_id])
+                  volume = volume_response['Volumes'][0]
+                  
+                  # Get volume tags for resize parameters (but we don't need EBSAutoResize on the volume anymore)
+                  volume_tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+                  
+                  # If the volume doesn't have ResizeAmountGB and MaxResizeGB tags, add them with defaults
+                  if 'ResizeAmountGB' not in volume_tags or 'MaxResizeGB' not in volume_tags:
+                      default_tags = []
+                      
+                      if 'ResizeAmountGB' not in volume_tags:
+                          default_tags.append({'Key': 'ResizeAmountGB', 'Value': '10'})
+                      
+                      if 'MaxResizeGB' not in volume_tags:
+                          default_tags.append({'Key': 'MaxResizeGB', 'Value': '1000'})
+                      
+                      if default_tags:
+                          ec2.create_tags(
+                              Resources=[volume_id],
+                              Tags=default_tags
+                          )
+                          logger.info(f"Added default resize parameter tags to volume {volume_id}")
+              except Exception as e:
+                  logger.error(f"Error getting volume information: {str(e)}")
+              
+              # Log the dimensions for debugging
+              logger.info(f"Creating alarm with dimensions: InstanceId={instance_id}, path={mount_path}")
+              
+              # Create or update CloudWatch alarm using CWAgent metrics
+              try:
+                  cloudwatch.put_metric_alarm(
+                      AlarmName=alarm_name,
+                      ComparisonOperator='GreaterThanOrEqualToThreshold',
+                      EvaluationPeriods=3,
+                      MetricName='disk_used_percent',
+                      Namespace='CWAgent',
+                      Period=300,  # 5 minutes
+                      Statistic='Average',
+                      Threshold=threshold,
+                      ActionsEnabled=True,
+                      AlarmDescription=f'Disk usage alarm for instance {instance_id}, volume {volume_id}, path {mount_path}',
+                      Dimensions=[
+                          {
+                              'Name': 'InstanceId',
+                              'Value': instance_id
+                          },
+                          {
+                              'Name': 'path',
+                              'Value': mount_path
+                          }
+                      ]
+                  )
+                  logger.info(f"Successfully created CloudWatch alarm for instance {instance_id}, mount path {mount_path}")
+              except Exception as e:
+                  logger.error(f"Error creating CloudWatch alarm: {str(e)}")
+                  return
               
               # Set up event target for Step Functions
-              rule_name = f"TriggerEBSResize-{volume_id}"
-              events.put_rule(
-                  Name=rule_name,
-                  EventPattern=json.dumps({
-                      "source": ["aws.cloudwatch"],
-                      "detail-type": ["CloudWatch Alarm State Change"],
-                      "detail": {
-                          "alarmName": [alarm_name],
-                          "state": {
-                              "value": ["ALARM"]
+              rule_name = f"TriggerEBSResize-{alarm_name}"
+              try:
+                  events.put_rule(
+                      Name=rule_name,
+                      EventPattern=json.dumps({
+                          "source": ["aws.cloudwatch"],
+                          "detail-type": ["CloudWatch Alarm State Change"],
+                          "detail": {
+                              "alarmName": [alarm_name],
+                              "state": {
+                                  "value": ["ALARM"]
+                              }
                           }
-                      }
-                  }),
-                  State='ENABLED'
-              )
-              
-              # Target the Step Function with the volume ID as input
-              events.put_targets(
-                  Rule=rule_name,
-                  Targets=[
-                      {
-                          'Id': f'StepFunction-{volume_id}',
-                          'Arn': STATE_MACHINE_ARN,
-                          'RoleArn': boto3.client("iam").get_role(RoleName='EBSResizeStepFunctionRole')['Role']['Arn'],
-                          'Input': json.dumps({
-                              "volumeId": volume_id
-                          })
-                      }
-                  ]
-              )
-              
-              logger.info(f"Created/updated alarm and event rule for volume {volume_id}")
-          
-          def check_for_new_volumes():
-              # Get all EBS volumes
-              volumes_response = ec2.describe_volumes()
-              
-              # Get all existing volume alarms
-              existing_alarms = set()
-              paginator = cloudwatch.get_paginator('describe_alarms')
-              for page in paginator.paginate(AlarmNamePrefix='EBSVolumeUsageAlarm-'):
-                  for alarm in page['MetricAlarms']:
-                      alarm_name = alarm['AlarmName']
-                      if alarm_name.startswith('EBSVolumeUsageAlarm-'):
-                          volume_id = alarm_name.split('-')[1]
-                          existing_alarms.add(volume_id)
-              
-              # Check each volume
-              for volume in volumes_response['Volumes']:
-                  volume_id = volume['VolumeId']
+                      }),
+                      State='ENABLED'
+                  )
                   
-                  # Get volume tags
-                  tags = {tag['Key']: tag['Value'] for tag in volume.get('Tags', [])}
+                  # Target the Step Function with both volume ID and instance info
+                  events.put_targets(
+                      Rule=rule_name,
+                      Targets=[
+                          {
+                              'Id': f'StepFunction-{volume_id}',
+                              'Arn': STATE_MACHINE_ARN,
+                              'RoleArn': os.environ['STEP_FUNCTION_ROLE_ARN'],
+                              'Input': json.dumps({
+                                  "volumeId": volume_id
+                              })
+                          }
+                      ]
+                  )
                   
-                  # If auto-resize is enabled and no alarm exists yet
-                  if tags.get('EBSAutoResize', 'false').lower() == 'true' and volume_id not in existing_alarms:
-                      create_volume_alarm(volume_id, volume['Size'])
-          
-          def setup_volume_check_schedule(lambda_arn):
+                  logger.info(f"Created/updated event rule for alarm {alarm_name}")
+              except Exception as e:
+                  logger.error(f"Error creating EventBridge rule: {str(e)}")
+
+          def check_for_tagged_instances():
+              """
+              Check for instances with the EBSAutoResize tag and set up monitoring for their volumes
+              """
+              # Get all EC2 instances
+              ec2_response = ec2.describe_instances()
+              
+              # Process all instances to find ones with EBSAutoResize tag
+              for reservation in ec2_response['Reservations']:
+                  for instance in reservation['Instances']:
+                      instance_id = instance['InstanceId']
+                      
+                      # Skip terminated or shutting-down instances
+                      if instance['State']['Name'] in ['terminated', 'shutting-down']:
+                          continue
+                      
+                      # Get instance tags
+                      instance_tags = {tag['Key']: tag['Value'] for tag in instance.get('Tags', [])}
+                      
+                      # Check if auto-resize is enabled for this instance
+                      if instance_tags.get('EBSAutoResize', 'false').lower() == 'true':
+                          logger.info(f"Instance {instance_id} has EBSAutoResize tag enabled. Setting up monitoring.")
+                          
+                          # For each attached volume, set up monitoring
+                          for block_device in instance.get('BlockDeviceMappings', []):
+                              if 'Ebs' in block_device:
+                                  volume_id = block_device['Ebs']['VolumeId']
+                                  device = block_device['DeviceName']
+                                  
+                                  # Set up monitoring for this volume
+                                  setup_volume_monitoring(instance_id, volume_id, device)
+
+          def setup_instance_check_schedule(lambda_arn):
+              """
+              Create an EventBridge rule to periodically check for new instances with tags
+              """
               # Create an EventBridge rule to run every hour
               events.put_rule(
-                  Name='CheckForNewEBSVolumesRule',
+                  Name='CheckForNewEBSAutoResizeInstancesRule',
                   ScheduleExpression='rate(1 hour)',
                   State='ENABLED',
-                  Description='Check for new EBS volumes to set up monitoring'
+                  Description='Check for new EC2 instances with EBSAutoResize tag'
               )
               
               # Set the Lambda function as the target
               events.put_targets(
-                  Rule='CheckForNewEBSVolumesRule',
+                  Rule='CheckForNewEBSAutoResizeInstancesRule',
                   Targets=[
                       {
-                          'Id': 'EBSVolumeCheckTarget',
+                          'Id': 'EBSAutoResizeInstanceCheckTarget',
                           'Arn': lambda_arn
                       }
                   ]
@@ -694,7 +858,7 @@ Resources:
                       StatementId='AllowEventBridgeToInvokeLambda',
                       Action='lambda:InvokeFunction',
                       Principal='events.amazonaws.com',
-                      SourceArn=events.describe_rule(Name='CheckForNewEBSVolumesRule')['Arn']
+                      SourceArn=events.describe_rule(Name='CheckForNewEBSAutoResizeInstancesRule')['Arn']
                   )
               except lambda_client.exceptions.ResourceConflictException:
                   # Permission already exists

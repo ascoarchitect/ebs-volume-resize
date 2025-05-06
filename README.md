@@ -8,10 +8,11 @@ This CloudFormation stack deploys an automated solution for monitoring and resiz
 - [Architecture](#architecture)
 - [Step Functions Workflow](#step-functions-workflow)
 - [Tag-Based Configuration](#tag-based-configuration)
+- [CloudWatch Agent Metrics](#cloudwatch-agent-metrics)
 - [Installation](#installation)
 - [Maintenance and Troubleshooting](#maintenance-and-troubleshooting)
 - [Limitations and Considerations](#limitations-and-considerations)
-- [Contributing](#contributing)
+- [Recent Updates](#recent-updates)
 
 ## Overview
 
@@ -52,12 +53,15 @@ flowchart TD
     SetupLambda --> RuleCreation[Create EventBridge Rules]
     SetupLambda --> PeriodicCheck[Hourly Check for\nNew Tagged Volumes]
     
+    %% Define data flow
+    CloudWatchAgent[CloudWatch Agent] --> |disk_used_percent| CloudWatch
+    
     %% Define styling
     classDef aws fill:#FF9900,stroke:#232F3E,color:black;
     classDef lambda fill:#009900,stroke:#232F3E,color:white;
     classDef setup fill:#3F8624,stroke:#232F3E,color:white;
     
-    class CloudWatch,EventBridge,StepFunction aws;
+    class CloudWatch,EventBridge,StepFunction,CloudWatchAgent aws;
     class EvaluateVolume,ResizeVolume,CheckOS,LinuxExtend,WindowsExtend lambda;
     class SetupLambda,AlarmCreation,RuleCreation,PeriodicCheck setup;
 ```
@@ -66,10 +70,11 @@ flowchart TD
 
 1. **CloudFormation Stack**: Deploys the entire solution with all required components
 2. **Alarm Creation Lambda**: Sets up monitoring for tagged volumes
-3. **CloudWatch Alarms**: Monitor volume usage and trigger when 90% threshold is exceeded
-4. **EventBridge Rules**: Route CloudWatch alarm events to the Step Functions state machine
-5. **Step Functions State Machine**: Orchestrates the end-to-end resize workflow
-6. **Lambda Functions**: Handle specific steps in the workflow:
+3. **CloudWatch Agent**: Collects disk usage metrics from EC2 instances
+4. **CloudWatch Alarms**: Monitor volume usage and trigger when 90% threshold is exceeded
+5. **EventBridge Rules**: Route CloudWatch alarm events to the Step Functions state machine
+6. **Step Functions State Machine**: Orchestrates the end-to-end resize workflow
+7. **Lambda Functions**: Handle specific steps in the workflow:
    - Evaluate Volume Tags: Determines if and how to resize the volume
    - Resize Volume: Performs the actual EBS volume resize
    - Check OS Type: Identifies if volume is attached to Linux or Windows
@@ -140,6 +145,47 @@ MaxResizeGB = 500
 
 With this configuration, the volume would resize in 20GB increments when usage exceeds 90%, but would not exceed 500GB total size.
 
+## CloudWatch Agent Metrics
+
+This solution uses the CloudWatch Agent metrics to monitor disk usage. The CloudWatch Agent must be installed and configured on your EC2 instances for the automation to function properly.
+
+### Required Metrics
+
+The solution uses the following CloudWatch Agent metric:
+
+- **disk_used_percent**: The percentage of total disk space that is used
+  - **Namespace**: `CWAgent`
+  - **Unit**: Percent
+  - **Dimensions**:
+    - `InstanceId`: The EC2 instance ID
+    - `path`: The mount path of the disk (e.g., `/`, `/data`)
+
+### CloudWatch Agent Setup
+
+The CloudWatch Agent should be configured to collect disk usage metrics. This is typically done via the CloudWatch Agent configuration file. Here's a minimal example:
+
+```json
+{
+  "metrics": {
+    "metrics_collected": {
+      "disk": {
+        "measurement": [
+          "used_percent"
+        ],
+        "resources": [
+          "/"
+        ],
+        "append_dimensions": {
+          "InstanceId": "${aws:InstanceId}"
+        }
+      }
+    }
+  }
+}
+```
+
+For complete installation and configuration instructions, refer to the [AWS CloudWatch Agent documentation](https://docs.aws.amazon.com/AmazonCloudWatch/latest/monitoring/Install-CloudWatch-Agent.html).
+
 ## Installation
 
 ### Prerequisites
@@ -147,6 +193,7 @@ With this configuration, the volume would resize in 20GB increments when usage e
 - AWS CLI configured with appropriate permissions
 - Permission to create IAM roles
 - Permission to deploy CloudFormation stacks
+- CloudWatch Agent installed and configured on target EC2 instances
 
 ### Required IAM Permissions
 
@@ -254,24 +301,46 @@ You can monitor the solution using:
 |-------|----------------|------------|
 | Volume not resizing | Tags not applied correctly | Verify tags are spelled correctly with proper values |
 | Volume not resizing | CloudWatch alarm not triggered | Check alarm configuration and threshold |
+| Volume not resizing | CloudWatch metrics missing | Ensure CloudWatch Agent is installed and collecting disk metrics |
 | Volume resized but filesystem not extended | SSM agent not running | Ensure SSM agent is installed and running |
 | Filesystem extension failed | Missing permissions | Check IAM roles and SSM permissions |
 | Windows filesystem not extending | Partition issue | Check Windows disk management logs |
+| Non-ASCII character errors | Mount path contains special characters | Update Lambda function to sanitize strings properly |
+
+### CloudWatch Agent Troubleshooting
+
+If CloudWatch metrics aren't appearing:
+
+1. Check the CloudWatch Agent status:
+   ```bash
+   sudo systemctl status amazon-cloudwatch-agent
+   ```
+
+2. Verify the agent configuration:
+   ```bash
+   sudo /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a status
+   ```
+
+3. Check the agent logs:
+   ```bash
+   sudo tail -f /opt/aws/amazon-cloudwatch-agent/logs/amazon-cloudwatch-agent.log
+   ```
+
+4. Manually verify metrics are being sent:
+   ```bash
+   aws cloudwatch list-metrics --namespace CWAgent --metric-name disk_used_percent
+   ```
 
 ### Alarm Not Triggering
 
 If alarms aren't triggering when expected:
 
-1. Verify the volume is publishing metrics:
+1. Verify the metrics exist for the instance and path:
    ```bash
-   aws cloudwatch get-metric-statistics \
-     --namespace AWS/EBS \
-     --metric-name VolumeUsedSize \
-     --dimensions Name=VolumeId,Value=vol-12345abcdef \
+   aws cloudwatch get-metric-data \
+     --metric-data-queries '[{"Id":"m1","MetricStat":{"Metric":{"Namespace":"CWAgent","MetricName":"disk_used_percent","Dimensions":[{"Name":"InstanceId","Value":"i-12345abcdef"},{"Name":"path","Value":"/"}]},"Period":300,"Stat":"Average"},"ReturnData":true}]' \
      --start-time $(date -d '1 hour ago' -u +%Y-%m-%dT%H:%M:%SZ) \
-     --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ) \
-     --period 300 \
-     --statistics Average
+     --end-time $(date -u +%Y-%m-%dT%H:%M:%SZ)
    ```
 
 2. Check if the alarm exists:
@@ -298,6 +367,7 @@ aws cloudformation update-stack \
   - Have the SSM agent installed and running
   - Have an instance profile allowing SSM operations
   - Be in a running state
+- **CloudWatch Agent**: The automation depends on the CloudWatch Agent being installed and configured
 - **Resize Timing**: There's a delay between volume resize and filesystem extension (30 seconds)
 - **Cost Considerations**: This solution uses:
   - CloudWatch alarms (per alarm pricing)
@@ -313,10 +383,22 @@ aws cloudformation update-stack \
 - SSM operations execute on instances with user-defined permissions
 - No sensitive data is stored in permanent storage
 
-## Contributing
+## Recent Updates
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/my-feature`)
-3. Commit your changes (`git commit -am 'Add my feature'`)
-4. Push to the branch (`git push origin feature/my-feature`)
-5. Create a new Pull Request
+### CloudWatch Metrics Update
+
+The solution has been updated to use CloudWatch Agent metrics instead of the non-existent `VolumeUsedSize` metric. Key changes include:
+
+1. **Switched to `disk_used_percent` metric**: Now using the standard CloudWatch Agent metric for disk usage
+2. **Added dimensions**: Using `InstanceId` and `path` dimensions for proper metric identification
+3. **Enhanced string sanitization**: Added robust handling for non-ASCII characters in mount paths
+4. **Fixed character encoding issues**: Implemented proper sanitization of CloudWatch parameters
+
+### String Sanitization Improvements
+
+To resolve issues with non-ASCII characters in CloudWatch API calls:
+
+1. **Unicode normalization**: Convert accented characters to their ASCII equivalents
+2. **Safe character filtering**: Remove characters that might cause issues with CloudWatch
+3. **Fallback paths**: Use default mount path (root "/") when proper path detection fails
+4. **Simplified alarm descriptions**: Reduced complexity to avoid character encoding issues
