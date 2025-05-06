@@ -148,6 +148,53 @@ With this configuration, the volume would resize in 20GB increments when usage e
 - Permission to create IAM roles
 - Permission to deploy CloudFormation stacks
 
+### Required IAM Permissions
+
+To deploy this CloudFormation template, you'll need the following IAM permissions:
+
+#### Permissions for Deployment
+
+1. **CloudFormation permissions**:
+   - `cloudformation:CreateStack`
+   - `cloudformation:DescribeStacks`
+   - `cloudformation:GetTemplate`
+
+2. **IAM permissions** (since the template creates IAM roles):
+   - `iam:CreateRole`
+   - `iam:PutRolePolicy`
+   - `iam:AttachRolePolicy` 
+   - `iam:PassRole`
+   - `iam:GetRole`
+
+3. **Service-specific permissions**:
+   - `lambda:CreateFunction`
+   - `lambda:AddPermission`
+   - `states:CreateStateMachine`
+   - `events:PutRule`
+   - `events:PutTargets`
+   - `cloudwatch:PutMetricAlarm`
+
+> **⚠️ Security Note**: While using `AdministratorAccess` policy would work for deploying this template, it is **not recommended** for production environments. Always follow the principle of least privilege by creating a custom policy with only the necessary permissions listed above.
+
+#### IAM Roles Created by the Stack
+
+The CloudFormation template creates all the necessary IAM roles as part of the stack:
+
+1. **EBSResizeStepFunctionRole**: 
+   - Allows Step Functions to invoke Lambda functions and perform EC2 operations
+   - Provides permissions to describe volumes, modify volumes, and manage tags
+
+2. **EBSResizeLambdaRole**:
+   - Grants Lambda functions permissions to interact with EC2, CloudWatch, and SSM
+   - Enables the Lambda functions to resize volumes and extend filesystems
+
+3. **EBSAlarmCreationRole**:
+   - Gives the alarm creation Lambda permissions to set up CloudWatch alarms
+   - Provides access to create EventBridge rules and targets
+   - Allows for invoking the Step Functions state machine
+
+The template follows the principle of least privilege, granting each role only the permissions needed for its specific functions within the automation workflow.
+
 ### Deployment Steps
 
 1. Save the CloudFormation template to a file (e.g., `ebs-auto-resize.yaml`)
